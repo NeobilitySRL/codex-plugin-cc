@@ -8,6 +8,7 @@ import process from "node:process";
 import { parseArgs } from "./lib/args.mjs";
 import { BROKER_BUSY_RPC_CODE, CodexAppServerClient } from "./lib/app-server.mjs";
 import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
+import { ThreadSubscriptions } from "./lib/thread-subscriptions.mjs";
 
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
 
@@ -67,12 +68,60 @@ async function main() {
 
   const appClient = await CodexAppServerClient.connect(cwd, { disableBroker: true });
   let activeRequestSocket = null;
+  let pendingRequestCount = 0;
   let activeStreamSocket = null;
   let activeStreamThreadIds = null;
   const sockets = new Set();
+  const subscriptions = new ThreadSubscriptions();
+  let requestQueue = Promise.resolve();
+  let cleanupError = null;
+  let shuttingDown = false;
+
+  function enqueue(operation) {
+    const result = requestQueue.then(operation);
+    // Callers handle failures; subsequent operations must still run.
+    requestQueue = result.then(() => undefined, () => undefined);
+    return result;
+  }
+
+  function request(socket, method, params) {
+    return enqueue(async () => {
+      if (cleanupError) {
+        throw cleanupError;
+      }
+      const result = await appClient.request(method, params);
+      subscriptions.record(socket, method, params, result);
+      return result;
+    });
+  }
+
+  function disconnect(socket) {
+    if (!sockets.delete(socket)) {
+      return;
+    }
+    clearSocketOwnership(socket);
+    if (shuttingDown) {
+      return;
+    }
+    void enqueue(async () => {
+      if (shuttingDown) {
+        return;
+      }
+      for (const threadId of subscriptions.release(socket)) {
+        try {
+          await appClient.request("thread/unsubscribe", { threadId });
+        } catch (error) {
+          cleanupError = new Error(`Failed to release Codex thread ${threadId}: ${error.message}`, { cause: error });
+          throw cleanupError;
+        }
+      }
+    }).catch((error) => {
+      process.stderr.write(`${error.message}. Restart the shared Codex broker before running another command.\n`);
+    });
+  }
 
   function clearSocketOwnership(socket) {
-    if (activeRequestSocket === socket) {
+    if (activeRequestSocket === socket && pendingRequestCount === 0) {
       activeRequestSocket = null;
     }
     if (activeStreamSocket === socket) {
@@ -86,13 +135,16 @@ async function main() {
     if (!target) {
       return;
     }
+    if (message.method === "thread/started") {
+      subscriptions.record(target, "thread/start", {}, message.params ?? {});
+    }
     send(target, message);
     if (message.method === "turn/completed" && activeStreamSocket === target) {
       const threadId = message.params?.threadId ?? null;
       if (!threadId || !activeStreamThreadIds || activeStreamThreadIds.has(threadId)) {
         activeStreamSocket = null;
         activeStreamThreadIds = null;
-        if (activeRequestSocket === target) {
+        if (activeRequestSocket === target && pendingRequestCount === 0) {
           activeRequestSocket = null;
         }
       }
@@ -100,6 +152,7 @@ async function main() {
   }
 
   async function shutdown(server) {
+    shuttingDown = true;
     for (const socket of sockets) {
       socket.end();
     }
@@ -183,7 +236,7 @@ async function main() {
 
         if (allowInterruptDuringActiveStream) {
           try {
-            const result = await appClient.request(message.method, message.params ?? {});
+            const result = await request(socket, message.method, message.params ?? {});
             send(socket, { id: message.id, result });
           } catch (error) {
             send(socket, {
@@ -196,40 +249,38 @@ async function main() {
 
         const isStreaming = STREAMING_METHODS.has(message.method);
         activeRequestSocket = socket;
+        pendingRequestCount += 1;
 
         try {
-          const result = await appClient.request(message.method, message.params ?? {});
+          const result = await request(socket, message.method, message.params ?? {});
           send(socket, { id: message.id, result });
-          if (isStreaming) {
+          if (isStreaming && sockets.has(socket)) {
             activeStreamSocket = socket;
             activeStreamThreadIds = buildStreamThreadIds(message.method, message.params ?? {}, result);
-          }
-          if (activeRequestSocket === socket) {
-            activeRequestSocket = null;
           }
         } catch (error) {
           send(socket, {
             id: message.id,
             error: buildJsonRpcError(error.rpcCode ?? -32000, error.message)
           });
-          if (activeRequestSocket === socket) {
-            activeRequestSocket = null;
-          }
           if (activeStreamSocket === socket && !isStreaming) {
             activeStreamSocket = null;
+          }
+        } finally {
+          pendingRequestCount -= 1;
+          if (activeRequestSocket === socket && pendingRequestCount === 0) {
+            activeRequestSocket = null;
           }
         }
       }
     });
 
     socket.on("close", () => {
-      sockets.delete(socket);
-      clearSocketOwnership(socket);
+      disconnect(socket);
     });
 
     socket.on("error", () => {
-      sockets.delete(socket);
-      clearSocketOwnership(socket);
+      disconnect(socket);
     });
   });
 
