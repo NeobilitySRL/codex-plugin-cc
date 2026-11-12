@@ -16,6 +16,8 @@ const readline = require("node:readline");
 	const STATE_PATH = ${JSON.stringify(statePath)};
 	const BEHAVIOR = ${JSON.stringify(behavior)};
 	const interruptibleTurns = new Map();
+	// Poll the test's signal so disconnect tests control when the response is delivered.
+	const THREAD_START_POLL_INTERVAL_MS = 10;
 
 	function loadState() {
 	  if (!fs.existsSync(STATE_PATH)) {
@@ -25,7 +27,8 @@ const readline = require("node:readline");
 	}
 
 function saveState(state) {
-  fs.writeFileSync(STATE_PATH, JSON.stringify(state, null, 2));
+  fs.writeFileSync(STATE_PATH + ".tmp", JSON.stringify(state, null, 2));
+  fs.renameSync(STATE_PATH + ".tmp", STATE_PATH);
 }
 
 function requiresExperimental(field, message, state) {
@@ -313,6 +316,17 @@ rl.on("line", (line) => {
           throw new Error("thread/start.persistFullHistory requires experimentalApi capability");
         }
         const thread = nextThread(state, message.params.cwd, message.params.ephemeral);
+        if (BEHAVIOR === "slow-thread-start") {
+          send({ method: "thread/started", params: { thread: { id: thread.id } } });
+          const timer = setInterval(() => {
+            if (!fs.existsSync(STATE_PATH + ".finish-start")) {
+              return;
+            }
+            clearInterval(timer);
+            send({ id: message.id, result: { thread: buildThread(thread) } });
+          }, THREAD_START_POLL_INTERVAL_MS);
+          break;
+        }
         send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } });
         send({ method: "thread/started", params: { thread: { id: thread.id } } });
         break;
@@ -324,6 +338,16 @@ rl.on("line", (line) => {
         thread.updatedAt = now();
         saveState(state);
         send({ id: message.id, result: {} });
+        break;
+      }
+
+      case "thread/unsubscribe": {
+        if (BEHAVIOR === "unsubscribe-fails") {
+          throw new Error("thread cleanup failed");
+        }
+        state.unsubscribed = [...(state.unsubscribed || []), message.params.threadId];
+        saveState(state);
+        send({ id: message.id, result: { status: "unsubscribed" } });
         break;
       }
 
