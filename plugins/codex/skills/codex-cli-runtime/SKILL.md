@@ -30,8 +30,10 @@ Command selection:
 - If the forwarded request includes `--effort`, pass it through to `task`.
 - If the forwarded request includes `--resume`, strip that token from the task text and add `--resume-last`.
 - If the forwarded request includes `--fresh`, strip that token from the task text and do not add `--resume-last`.
+- If the forwarded request includes `--ephemeral`, strip that token from the task text, add `--ephemeral`, and do not add `--resume-last`.
 - `--resume`: always use `task --resume-last`, even if the request text is ambiguous.
 - `--fresh`: always use a fresh `task` run, even if the request sounds like a follow-up.
+- `--ephemeral`: always use a fresh `task --ephemeral` run. Its Codex thread is not persisted, does not appear in the Codex app or `codex resume`, and is never offered to `--resume-last`. `task` rejects `--ephemeral` together with `--resume`/`--resume-last`.
 - `--effort`: accepted values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`.
 - `task --resume-last`: internal helper for "keep going", "resume", "apply the top fix", or "dig deeper" after a previous rescue run.
 

@@ -137,7 +137,9 @@ Use it when you want Codex to:
 > [!NOTE]
 > Depending on the task and the model you choose these tasks might take a long time and it's generally recommended to force the task to be in the background or move the agent to the background.
 
-It supports `--background`, `--wait`, `--resume`, and `--fresh`. If you omit `--resume` and `--fresh`, the plugin can offer to continue the latest rescue thread for this repo.
+It supports `--background`, `--wait`, `--resume`, `--fresh`, and `--ephemeral`. If you omit `--resume`, `--fresh`, and `--ephemeral`, the plugin can offer to continue the latest rescue thread for this repo.
+
+`--ephemeral` runs the task on a one-off Codex thread: it is not saved to your Codex history (it does not show up in the Codex app or in `codex resume`) and it is never offered when you later continue with `--resume`. It cannot be combined with `--resume`.
 
 Examples:
 
@@ -148,6 +150,7 @@ Examples:
 /codex:rescue --model gpt-5.4-mini --effort medium investigate the flaky integration test
 /codex:rescue --model spark fix the issue quickly
 /codex:rescue --background investigate the regression
+/codex:rescue --ephemeral explain what this stack trace means
 ```
 
 You can also just ask for a task to be delegated to Codex:

@@ -763,6 +763,136 @@ test("task --fresh is treated as routing control and does not leak into the prom
   assert.equal(fakeState.lastTurnStart.prompt, "diagnose the flaky test");
 });
 
+function initTaskRepo() {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  return repo;
+}
+
+test("task without --ephemeral starts a persisted, named thread", () => {
+  const repo = initTaskRepo();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+
+  const result = run("node", [SCRIPT, "task", "diagnose the flaky test"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.threads.length, 1);
+  assert.equal(fakeState.threads[0].ephemeral, false);
+  assert.match(fakeState.threads[0].name, /^Codex Companion Task/);
+});
+
+test("task --ephemeral starts an ephemeral thread without a persisted name", () => {
+  const repo = initTaskRepo();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+
+  const result = run("node", [SCRIPT, "task", "--ephemeral", "diagnose the flaky test"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.threads.length, 1);
+  assert.equal(fakeState.threads[0].ephemeral, true);
+  assert.equal(fakeState.threads[0].name, null);
+  assert.equal(fakeState.lastTurnStart.prompt, "diagnose the flaky test");
+});
+
+test("task --background --ephemeral runs the detached worker on an ephemeral thread", async () => {
+  const repo = initTaskRepo();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir, "slow-task");
+
+  const launched = run("node", [SCRIPT, "task", "--background", "--ephemeral", "--json", "investigate the failing test"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(launched.status, 0, launched.stderr);
+  const launchPayload = JSON.parse(launched.stdout);
+
+  const waitedStatus = run(
+    "node",
+    [SCRIPT, "status", launchPayload.jobId, "--wait", "--timeout-ms", "15000", "--json"],
+    {
+      cwd: repo,
+      env: buildEnv(binDir)
+    }
+  );
+  assert.equal(waitedStatus.status, 0, waitedStatus.stderr);
+  assert.equal(JSON.parse(waitedStatus.stdout).job.status, "completed");
+
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.threads.length, 1);
+  assert.equal(fakeState.threads[0].ephemeral, true);
+  assert.equal(fakeState.threads[0].name, null);
+});
+
+for (const resumeFlag of ["--resume", "--resume-last"]) {
+  test(`task --ephemeral refuses ${resumeFlag}`, () => {
+    const repo = initTaskRepo();
+    const binDir = makeTempDir();
+    const statePath = path.join(binDir, "fake-codex-state.json");
+    installFakeCodex(binDir);
+
+    for (const background of [false, true]) {
+      const args = [SCRIPT, "task", ...(background ? ["--background"] : []), "--ephemeral", resumeFlag, "follow up"];
+      const result = run("node", args, {
+        cwd: repo,
+        env: buildEnv(binDir)
+      });
+
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, /--ephemeral cannot be combined with --resume\/--resume-last/);
+    }
+    assert.equal(fs.existsSync(statePath), false);
+  });
+}
+
+test("ephemeral tasks are never offered as resume candidates", () => {
+  const repo = initTaskRepo();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const env = {
+    ...buildEnv(binDir),
+    CODEX_COMPANION_SESSION_ID: "sess-ephemeral"
+  };
+  const readCandidate = () => {
+    const result = run("node", [SCRIPT, "task-resume-candidate", "--json"], { cwd: repo, env });
+    assert.equal(result.status, 0, result.stderr);
+    return JSON.parse(result.stdout);
+  };
+
+  const firstEphemeral = run("node", [SCRIPT, "task", "--ephemeral", "first quick question"], { cwd: repo, env });
+  assert.equal(firstEphemeral.status, 0, firstEphemeral.stderr);
+  assert.equal(readCandidate().available, false);
+
+  const persisted = run("node", [SCRIPT, "task", "persisted task"], { cwd: repo, env });
+  assert.equal(persisted.status, 0, persisted.stderr);
+  const secondEphemeral = run("node", [SCRIPT, "task", "--ephemeral", "second quick question"], { cwd: repo, env });
+  assert.equal(secondEphemeral.status, 0, secondEphemeral.stderr);
+
+  const payload = readCandidate();
+  assert.equal(payload.available, true);
+  assert.equal(payload.candidate.threadId, "thr_2");
+
+  const resumed = run("node", [SCRIPT, "task", "--resume-last", "follow up"], { cwd: repo, env });
+  assert.equal(resumed.status, 0, resumed.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+  assert.equal(fakeState.lastTurnStart.threadId, "thr_2");
+});
+
 test("task forwards model selection and reasoning effort to app-server turn/start", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
