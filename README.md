@@ -288,6 +288,12 @@ Your configuration will be picked up based on:
 
 Check out the Codex docs for more [configuration options](https://developers.openai.com/codex/config-reference).
 
+### Shared Runtime
+
+Commands in the same workspace share one Codex app server through a small background broker. The broker stops itself, together with its app server, after 30 minutes without a connected command or a request in flight, and the next command starts a new one. A running task or review keeps its command connected, so it never counts as idle.
+
+To change the idle period, set `CODEX_COMPANION_BROKER_IDLE_MS` to a number of milliseconds in the environment Claude Code runs in. `0` or a negative value turns the idle shutdown off.
+
 ### Moving The Work Over To Codex
 
 Delegated tasks and any [stop gate](#what-does-the-review-gate-do) run can also be directly resumed inside Codex by running `codex resume` either with the specific session ID you received from running `/codex:result` or `/codex:status` or by selecting it from the list.

@@ -2291,6 +2291,46 @@ test("commands lazily start and reuse one shared app-server after first use", as
   assert.equal(cleanup.status, 0, cleanup.stderr);
 });
 
+test("task starts a new shared app-server after the previous broker exited idle", async () => {
+  const repo = initTaskRepo();
+  const binDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  const env = {
+    ...buildEnv(binDir),
+    CODEX_COMPANION_BROKER_IDLE_MS: "500"
+  };
+
+  const first = run("node", [SCRIPT, "task", "first task"], { cwd: repo, env });
+  assert.equal(first.status, 0, first.stderr);
+  const firstSession = loadBrokerSession(repo);
+  if (!firstSession) {
+    return;
+  }
+
+  await waitFor(() => loadBrokerSession(repo) === null && !fs.existsSync(firstSession.pidFile), { timeoutMs: 10000 });
+
+  const second = run("node", [SCRIPT, "task", "second task"], { cwd: repo, env });
+  assert.equal(second.status, 0, second.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
+  assert.equal(fakeState.appServerStarts, 2);
+  assert.equal(fakeState.threads.length, 2);
+
+  const secondSession = loadBrokerSession(repo);
+  assert.ok(secondSession);
+  assert.notEqual(secondSession.endpoint, firstSession.endpoint);
+
+  const cleanup = run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env,
+    input: JSON.stringify({
+      hook_event_name: "SessionEnd",
+      cwd: repo
+    })
+  });
+  assert.equal(cleanup.status, 0, cleanup.stderr);
+});
+
 test("setup reuses an existing shared app-server without starting another one", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();

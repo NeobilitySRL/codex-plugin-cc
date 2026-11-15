@@ -10,7 +10,28 @@ import { resolveStateDir } from "./state.mjs";
 
 export const PID_FILE_ENV = "CODEX_COMPANION_APP_SERVER_PID_FILE";
 export const LOG_FILE_ENV = "CODEX_COMPANION_APP_SERVER_LOG_FILE";
+export const BROKER_IDLE_MS_ENV = "CODEX_COMPANION_BROKER_IDLE_MS";
+// A broker with no client and no request in flight for this long shuts itself down.
+export const DEFAULT_BROKER_IDLE_MS = 30 * 60 * 1000;
+// Largest delay Node.js setTimeout accepts; longer delays fire after 1 ms instead.
+const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
 const BROKER_STATE_FILE = "broker.json";
+
+// Returns the broker idle period in milliseconds; 0 means the broker never exits idle.
+export function resolveBrokerIdleMs(env = process.env) {
+  const raw = env?.[BROKER_IDLE_MS_ENV];
+  if (raw == null || String(raw).trim() === "") {
+    return DEFAULT_BROKER_IDLE_MS;
+  }
+  const value = Number(raw);
+  if (!Number.isFinite(value)) {
+    throw new Error(`${BROKER_IDLE_MS_ENV} must be a number of milliseconds (0 or less disables the idle shutdown), got "${raw}".`);
+  }
+  if (value > MAX_TIMER_DELAY_MS) {
+    throw new Error(`${BROKER_IDLE_MS_ENV} must be at most ${MAX_TIMER_DELAY_MS} milliseconds, got "${raw}". Use 0 to disable the idle shutdown.`);
+  }
+  return value > 0 ? value : 0;
+}
 
 export function createBrokerSessionDir(prefix = "cxc-") {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -111,6 +132,8 @@ async function isBrokerEndpointReady(endpoint) {
 }
 
 export async function ensureBrokerSession(cwd, options = {}) {
+  // Reject a malformed idle setting here so the caller sees it instead of a broker that fails to start.
+  resolveBrokerIdleMs(options.env ?? process.env);
   const existing = loadBrokerSession(cwd);
   if (existing && (await isBrokerEndpointReady(existing.endpoint))) {
     return existing;

@@ -8,6 +8,13 @@ import process from "node:process";
 import { parseArgs } from "./lib/args.mjs";
 import { BROKER_BUSY_RPC_CODE, CodexAppServerClient } from "./lib/app-server.mjs";
 import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
+import {
+  clearBrokerSession,
+  loadBrokerSession,
+  resolveBrokerIdleMs,
+  teardownBrokerSession
+} from "./lib/broker-lifecycle.mjs";
+import { IdleTimer } from "./lib/idle-timer.mjs";
 import { ThreadSubscriptions } from "./lib/thread-subscriptions.mjs";
 
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
@@ -64,6 +71,7 @@ async function main() {
   const endpoint = String(options.endpoint);
   const listenTarget = parseBrokerEndpoint(endpoint);
   const pidFile = options["pid-file"] ? path.resolve(options["pid-file"]) : null;
+  const idleMs = resolveBrokerIdleMs(process.env);
   writePidFile(pidFile);
 
   const appClient = await CodexAppServerClient.connect(cwd, { disableBroker: true });
@@ -76,6 +84,20 @@ async function main() {
   let requestQueue = Promise.resolve();
   let cleanupError = null;
   let shuttingDown = false;
+  const idleTimer = new IdleTimer(idleMs, {
+    isBusy,
+    onIdle: () => {
+      enqueue(shutdownIdle).catch((error) => {
+        process.stderr.write(`Idle shutdown of the shared Codex broker failed: ${error.message}\n`);
+        process.exit(1);
+      });
+    }
+  });
+
+  // A connected client covers its running turns; a request whose client disconnected still counts until it settles.
+  function isBusy() {
+    return sockets.size > 0 || pendingRequestCount > 0;
+  }
 
   function enqueue(operation) {
     const result = requestQueue.then(operation);
@@ -99,6 +121,7 @@ async function main() {
     if (!sockets.delete(socket)) {
       return;
     }
+    idleTimer.reset();
     clearSocketOwnership(socket);
     if (shuttingDown) {
       return;
@@ -153,11 +176,14 @@ async function main() {
 
   async function shutdown(server) {
     shuttingDown = true;
+    idleTimer.stop();
+    // Stop accepting connections before the first await so no client reaches a closing app-server.
+    const serverClosed = new Promise((resolve) => server.close(resolve));
     for (const socket of sockets) {
       socket.end();
     }
     await appClient.close().catch(() => {});
-    await new Promise((resolve) => server.close(resolve));
+    await serverClosed;
     if (listenTarget.kind === "unix" && fs.existsSync(listenTarget.path)) {
       fs.unlinkSync(listenTarget.path);
     }
@@ -166,14 +192,39 @@ async function main() {
     }
   }
 
+  // Runs after queued requests and thread releases. Removes broker.json and the session files only while
+  // broker.json still names this broker, so a newer broker for the same workspace keeps its state.
+  async function shutdownIdle() {
+    if (shuttingDown || isBusy()) {
+      return;
+    }
+    const session = loadBrokerSession(cwd);
+    const ownsSession = session?.endpoint === endpoint;
+    if (ownsSession) {
+      clearBrokerSession(cwd);
+    }
+    await shutdown(server);
+    if (ownsSession) {
+      teardownBrokerSession({
+        endpoint,
+        pidFile: session.pidFile ?? pidFile,
+        logFile: session.logFile ?? null,
+        sessionDir: session.sessionDir ?? null
+      });
+    }
+    process.exit(0);
+  }
+
   appClient.setNotificationHandler(routeNotification);
 
   const server = net.createServer((socket) => {
     sockets.add(socket);
+    idleTimer.reset();
     socket.setEncoding("utf8");
     let buffer = "";
 
     socket.on("data", async (chunk) => {
+      idleTimer.reset();
       buffer += chunk;
       let newlineIndex = buffer.indexOf("\n");
       while (newlineIndex !== -1) {
@@ -271,6 +322,7 @@ async function main() {
           if (activeRequestSocket === socket && pendingRequestCount === 0) {
             activeRequestSocket = null;
           }
+          idleTimer.reset();
         }
       }
     });
@@ -295,6 +347,7 @@ async function main() {
   });
 
   server.listen(listenTarget.path);
+  idleTimer.reset();
 }
 
 main().catch((error) => {
