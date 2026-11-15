@@ -2295,30 +2295,41 @@ test("task starts a new shared app-server after the previous broker exited idle"
   const repo = initTaskRepo();
   const binDir = makeTempDir();
   const fakeStatePath = path.join(binDir, "fake-codex-state.json");
-  installFakeCodex(binDir);
+  installFakeCodex(binDir, "interruptible-slow-task");
   const env = {
     ...buildEnv(binDir),
-    CODEX_COMPANION_BROKER_IDLE_MS: "500"
+    CODEX_COMPANION_BROKER_IDLE_MS: "1000"
   };
+  const stateFile = path.join(resolveStateDir(repo), "state.json");
 
-  const first = run("node", [SCRIPT, "task", "first task"], { cwd: repo, env });
-  assert.equal(first.status, 0, first.stderr);
-  const firstSession = loadBrokerSession(repo);
-  if (!firstSession) {
-    return;
+  // A background task keeps its worker connected to the broker for the whole turn, so the broker state is
+  // read while that broker cannot exit idle. Returns the broker session the task used.
+  async function runTaskOnSharedBroker(prompt) {
+    const launched = run("node", [SCRIPT, "task", "--background", "--json", prompt], { cwd: repo, env });
+    assert.equal(launched.status, 0, launched.stderr);
+    const { jobId } = JSON.parse(launched.stdout);
+    await waitFor(() => {
+      const job = JSON.parse(fs.readFileSync(stateFile, "utf8")).jobs.find((candidate) => candidate.id === jobId);
+      return job?.status === "running" && job.turnId ? job : null;
+    }, { timeoutMs: 15000 });
+    const session = loadBrokerSession(repo);
+    assert.ok(session, "The running task did not use a shared broker.");
+
+    const finished = run("node", [SCRIPT, "status", jobId, "--wait", "--timeout-ms", "15000", "--json"], { cwd: repo, env });
+    assert.equal(finished.status, 0, finished.stderr);
+    assert.equal(JSON.parse(finished.stdout).job.status, "completed");
+    return session;
   }
 
-  await waitFor(() => loadBrokerSession(repo) === null && !fs.existsSync(firstSession.pidFile), { timeoutMs: 10000 });
+  const firstSession = await runTaskOnSharedBroker("first task");
+  await waitFor(() => !fs.existsSync(firstSession.pidFile), { timeoutMs: 15000 });
+  assert.equal(loadBrokerSession(repo), null);
 
-  const second = run("node", [SCRIPT, "task", "second task"], { cwd: repo, env });
-  assert.equal(second.status, 0, second.stderr);
+  const secondSession = await runTaskOnSharedBroker("second task");
+  assert.notEqual(secondSession.endpoint, firstSession.endpoint);
   const fakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
   assert.equal(fakeState.appServerStarts, 2);
   assert.equal(fakeState.threads.length, 2);
-
-  const secondSession = loadBrokerSession(repo);
-  assert.ok(secondSession);
-  assert.notEqual(secondSession.endpoint, firstSession.endpoint);
 
   const cleanup = run("node", [SESSION_HOOK, "SessionEnd"], {
     cwd: repo,
