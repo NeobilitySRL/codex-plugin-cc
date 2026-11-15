@@ -332,17 +332,34 @@ class BrokerCodexAppServerClient extends AppServerClientBase {
   }
 }
 
+// Finds the workspace broker from broker.json, starting one unless the caller only reuses an existing broker.
+async function discoverBrokerEndpoint(cwd, options) {
+  if (options.reuseExistingBroker) {
+    return loadBrokerSession(cwd)?.endpoint ?? null;
+  }
+  const brokerSession = await ensureBrokerSession(cwd, { env: options.env });
+  return brokerSession?.endpoint ?? null;
+}
+
 export class CodexAppServerClient {
   static async connect(cwd, options = {}) {
     let brokerEndpoint = null;
     if (!options.disableBroker) {
       brokerEndpoint = options.brokerEndpoint ?? options.env?.[BROKER_ENDPOINT_ENV] ?? process.env[BROKER_ENDPOINT_ENV] ?? null;
-      if (!brokerEndpoint && options.reuseExistingBroker) {
-        brokerEndpoint = loadBrokerSession(cwd)?.endpoint ?? null;
-      }
-      if (!brokerEndpoint && !options.reuseExistingBroker) {
-        const brokerSession = await ensureBrokerSession(cwd, { env: options.env });
-        brokerEndpoint = brokerSession?.endpoint ?? null;
+      if (!brokerEndpoint) {
+        brokerEndpoint = await discoverBrokerEndpoint(cwd, options);
+        if (brokerEndpoint) {
+          const client = new BrokerCodexAppServerClient(cwd, { ...options, brokerEndpoint });
+          try {
+            await client.initialize();
+            return client;
+          } catch {
+            // A discovered broker can exit idle between discovery and this handshake. No application
+            // request has been sent yet, so discover the broker again once; the retry's error is reported.
+            await client.close().catch(() => {});
+            brokerEndpoint = await discoverBrokerEndpoint(cwd, options);
+          }
+        }
       }
     }
     const client = brokerEndpoint
