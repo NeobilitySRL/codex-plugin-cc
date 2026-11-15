@@ -56,11 +56,11 @@ function writePidFile(pidFile) {
 async function main() {
   const [subcommand, ...argv] = process.argv.slice(2);
   if (subcommand !== "serve") {
-    throw new Error("Usage: node scripts/app-server-broker.mjs serve --endpoint <value> [--cwd <path>] [--pid-file <path>]");
+    throw new Error("Usage: node scripts/app-server-broker.mjs serve --endpoint <value> [--cwd <path>] [--pid-file <path>] [--log-file <path>]");
   }
 
   const { options } = parseArgs(argv, {
-    valueOptions: ["cwd", "pid-file", "endpoint"]
+    valueOptions: ["cwd", "pid-file", "log-file", "endpoint"]
   });
 
   if (!options.endpoint) {
@@ -71,6 +71,7 @@ async function main() {
   const endpoint = String(options.endpoint);
   const listenTarget = parseBrokerEndpoint(endpoint);
   const pidFile = options["pid-file"] ? path.resolve(options["pid-file"]) : null;
+  const logFile = options["log-file"] ? path.resolve(options["log-file"]) : null;
   const idleMs = resolveBrokerIdleMs(process.env);
   writePidFile(pidFile);
 
@@ -192,8 +193,9 @@ async function main() {
     }
   }
 
-  // Runs after queued requests and thread releases. Removes broker.json and the session files only while
-  // broker.json still names this broker, so a newer broker for the same workspace keeps its state.
+  // Runs after queued requests and thread releases. Always removes this broker's own socket, pid file,
+  // log file and session directory; removes broker.json only while it still names this broker, so a newer
+  // broker for the same workspace keeps its state.
   async function shutdownIdle() {
     if (shuttingDown || isBusy()) {
       return;
@@ -204,14 +206,12 @@ async function main() {
       clearBrokerSession(cwd);
     }
     await shutdown(server);
-    if (ownsSession) {
-      teardownBrokerSession({
-        endpoint,
-        pidFile: session.pidFile ?? pidFile,
-        logFile: session.logFile ?? null,
-        sessionDir: session.sessionDir ?? null
-      });
-    }
+    teardownBrokerSession({
+      endpoint,
+      pidFile,
+      logFile: logFile ?? (ownsSession ? session.logFile ?? null : null),
+      sessionDir: ownsSession ? session.sessionDir ?? null : null
+    });
     process.exit(0);
   }
 
